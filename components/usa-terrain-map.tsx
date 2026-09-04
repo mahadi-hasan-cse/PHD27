@@ -2,7 +2,7 @@
 
 import React, { useEffect, useRef, useState, useMemo } from 'react'
 import { universities, type University } from '@/app/universities'
-import { UNIVERSITY_COORDINATES, STATE_BOUNDS_CENTER } from '@/lib/university-coordinates'
+import { UNIVERSITY_COORDINATES, ALL_STATE_CENTROIDS_GPS } from '@/lib/university-coordinates'
 import { STATE_NAMES } from '@/lib/usa-map-data'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -10,9 +10,7 @@ import {
   Calendar,
   DollarSign,
   ExternalLink,
-  Layers,
   MapPin,
-  Maximize2,
   Sparkles,
   Trophy,
   Users
@@ -38,40 +36,50 @@ const TILE_LAYERS: Record<TileLayerKey, { name: string; url: string; attribution
   topo: {
     name: 'Topographic Terrain',
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',
-    attribution: 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ, TomTom, Intermap, iPC, USGS, FAO, NPS, NRCAN, GeoBase, Kadaster NL, Ordnance Survey, Esri Japan, METI, Esri China (Hong Kong), and the GIS User Community',
+    attribution: 'Tiles &copy; Esri &mdash; Esri, USGS, DeLorme, TomTom, Intermap, NPS, NRCAN',
     maxZoom: 18,
   },
   satellite: {
     name: 'Satellite Hybrid',
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-    attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community',
+    attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye',
     maxZoom: 18,
   },
   carto: {
     name: 'Carto Voyager',
     url: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+    attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
     maxZoom: 19,
   },
   natgeo: {
     name: 'Physical Shaded Relief',
     url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Physical_Map/MapServer/tile/{z}/{y}/{x}',
-    attribution: 'Tiles &copy; Esri &mdash; Source: US National Park Service',
+    attribution: 'Tiles &copy; Esri &mdash; US National Park Service',
     maxZoom: 8,
   },
 }
 
+// Inverted state name lookup from full name to 2-letter abbreviation
+const STATE_NAME_TO_CODE = Object.entries(STATE_NAMES).reduce<Record<string, string>>((acc, [code, name]) => {
+  acc[name.toLowerCase()] = code
+  return acc
+}, {})
+
 export function UsaTerrainMap({ selectedState, onSelectState, onResetAll }: UsaTerrainMapProps) {
   const mapContainerRef = useRef<HTMLDivElement>(null)
   const mapInstanceRef = useRef<any>(null)
+  const geoJsonLayerRef = useRef<any>(null)
   const markersLayerRef = useRef<any>(null)
+  const stateLabelsLayerRef = useRef<any>(null)
   const currentTileLayerRef = useRef<any>(null)
+  const geoJsonDataRef = useRef<any>(null)
 
   const [activeLayer, setActiveLayer] = useState<TileLayerKey>('topo')
   const [selectedUniversity, setSelectedUniversity] = useState<University | null>(null)
+  const [hoveredStateCode, setHoveredStateCode] = useState<string | null>(null)
   const [isMapReady, setIsMapReady] = useState(false)
 
-  // Group universities by state
+  // Group universities by state abbreviation
   const universitiesByState = useMemo(() => {
     const map = new Map<string, University[]>()
     for (const u of universities) {
@@ -100,6 +108,16 @@ export function UsaTerrainMap({ selectedState, onSelectState, onResetAll }: UsaT
       : selectedUniversity
       ? [selectedUniversity]
       : universities.slice(0, 8)
+
+  // Fetch US States GeoJSON boundaries once
+  useEffect(() => {
+    fetch('/us-states.json')
+      .then((res) => res.json())
+      .then((data) => {
+        geoJsonDataRef.current = data
+      })
+      .catch(() => undefined)
+  }, [])
 
   // Initialize Leaflet Map on Mount
   useEffect(() => {
@@ -134,8 +152,13 @@ export function UsaTerrainMap({ selectedState, onSelectState, onResetAll }: UsaT
         }).addTo(map)
         currentTileLayerRef.current = tileLayer
 
-        // Markers layer group
+        // Layer groups
+        const geoLayer = L.layerGroup().addTo(map)
+        const labelsLayer = L.layerGroup().addTo(map)
         const markersGroup = L.layerGroup().addTo(map)
+
+        geoJsonLayerRef.current = geoLayer
+        stateLabelsLayerRef.current = labelsLayer
         markersLayerRef.current = markersGroup
 
         mapInstanceRef.current = map
@@ -172,7 +195,148 @@ export function UsaTerrainMap({ selectedState, onSelectState, onResetAll }: UsaT
     })
   }, [activeLayer])
 
-  // Render & Update Markers on Map
+  // Render & Update State Borders (GeoJSON) and State Name Badges
+  useEffect(() => {
+    if (!mapInstanceRef.current || !isMapReady) return
+
+    import('leaflet').then((L) => {
+      const map = mapInstanceRef.current
+      const geoLayer = geoJsonLayerRef.current
+      const labelsLayer = stateLabelsLayerRef.current
+
+      if (!geoLayer || !labelsLayer) return
+
+      geoLayer.clearLayers()
+      labelsLayer.clearLayers()
+
+      // 1. Render Visible State Boundaries via GeoJSON
+      if (geoJsonDataRef.current) {
+        const geojson = L.geoJSON(geoJsonDataRef.current, {
+          style: (feature: any) => {
+            const stateName = feature?.properties?.name || ''
+            const stateCode = STATE_NAME_TO_CODE[stateName.toLowerCase()] || ''
+            const count = (universitiesByState.get(stateCode) || []).length
+            const isSelected = selectedState === stateCode
+            const isHovered = hoveredStateCode === stateCode
+
+            if (isSelected) {
+              return {
+                color: '#30d7b0',
+                weight: 3.5,
+                opacity: 1,
+                fillColor: '#30d7b0',
+                fillOpacity: 0.28,
+                dashArray: '',
+              }
+            }
+            if (isHovered) {
+              return {
+                color: '#087e6a',
+                weight: 2.8,
+                opacity: 1,
+                fillColor: '#087e6a',
+                fillOpacity: 0.2,
+                dashArray: '',
+              }
+            }
+            if (count > 0) {
+              return {
+                color: '#163a5f',
+                weight: 2,
+                opacity: 0.9,
+                fillColor: count >= 5 ? '#0b6477' : '#178096',
+                fillOpacity: 0.12,
+                dashArray: '3, 4',
+              }
+            }
+            return {
+              color: '#334155',
+              weight: 1.2,
+              opacity: 0.6,
+              fillColor: '#000000',
+              fillOpacity: 0.03,
+              dashArray: '2, 3',
+            }
+          },
+          onEachFeature: (feature: any, layer: any) => {
+            const stateName = feature?.properties?.name || ''
+            const stateCode = STATE_NAME_TO_CODE[stateName.toLowerCase()] || ''
+            const count = (universitiesByState.get(stateCode) || []).length
+
+            layer.on({
+              mouseover: () => setHoveredStateCode(stateCode),
+              mouseout: () => setHoveredStateCode(null),
+              click: () => {
+                if (count > 0) {
+                  onSelectState(stateCode)
+                }
+              },
+            })
+
+            // State Tooltip
+            if (count > 0) {
+              layer.bindTooltip(
+                `<div style="font-family: inherit; font-size: 12px; font-weight: bold; color: #071b34;">
+                  ${stateName} (${stateCode})
+                  <div style="font-size: 11px; font-weight: 600; color: #087e6a;">${count} CS PhD Programs</div>
+                </div>`,
+                { sticky: true, opacity: 0.95 }
+              )
+            }
+          },
+        })
+
+        geoLayer.addLayer(geojson)
+      }
+
+      // 2. Render Prominent State Name & Code Labels at Centroids
+      Object.entries(ALL_STATE_CENTROIDS_GPS).forEach(([code, data]) => {
+        const count = (universitiesByState.get(code) || []).length
+        const isSelected = selectedState === code
+        const isHovered = hoveredStateCode === code
+
+        // Create HTML for State Name Label
+        const labelHtml = `
+          <div class="pointer-events-none select-none flex flex-col items-center justify-center transform -translate-x-1/2 -translate-y-1/2">
+            <div class="px-2 py-0.5 rounded-md border shadow-md flex items-center gap-1 transition-all duration-200 ${
+              isSelected
+                ? 'bg-[#30d7b0] border-white text-[#071b34] scale-110 font-bold ring-2 ring-[#30d7b0]/50'
+                : count > 0
+                ? 'bg-[#071b34]/90 border-[#30d7b0]/60 text-white backdrop-blur-xs hover:border-[#30d7b0]'
+                : 'bg-black/40 border-white/20 text-[#cbd5e1] text-[10px]'
+            }">
+              <span class="font-extrabold tracking-wider text-[11px] font-sans">
+                ${data.name.toUpperCase()}
+              </span>
+              ${
+                count > 0
+                  ? `<span class="px-1 py-0.2 rounded text-[10px] font-mono font-bold ${
+                      isSelected ? 'bg-[#071b34] text-[#30d7b0]' : 'bg-[#30d7b0] text-[#071b34]'
+                    }">${count}</span>`
+                  : ''
+              }
+            </div>
+          </div>
+        `
+
+        const labelIcon = L.divIcon({
+          className: 'custom-state-label',
+          html: labelHtml,
+          iconSize: [120, 24],
+          iconAnchor: [60, 12],
+        })
+
+        const labelMarker = L.marker([data.lat, data.lng], {
+          icon: labelIcon,
+          interactive: false,
+        })
+
+        labelsLayer.addLayer(labelMarker)
+      })
+    })
+  }, [selectedState, hoveredStateCode, isMapReady, universitiesByState, onSelectState])
+
+  // Render & Update University Rank Pins on Map
   useEffect(() => {
     if (!mapInstanceRef.current || !isMapReady) return
 
@@ -183,7 +347,6 @@ export function UsaTerrainMap({ selectedState, onSelectState, onResetAll }: UsaT
 
       markersGroup.clearLayers()
 
-      // Render University Pins
       universities.forEach((u) => {
         const coords = UNIVERSITY_COORDINATES[u.university]
         if (!coords) return
@@ -191,18 +354,18 @@ export function UsaTerrainMap({ selectedState, onSelectState, onResetAll }: UsaT
         const isSelectedState = selectedState === u.state
         const isSelectedUni = selectedUniversity?.rank === u.rank
 
-        // Create Custom HTML Marker Icon
+        // Custom University Ranking Marker Icon
         const iconHtml = `
           <div class="relative group cursor-pointer" style="transform: translate(-50%, -100%);">
             <div class="relative flex items-center justify-center">
               ${
                 isSelectedState || isSelectedUni
-                  ? `<div class="absolute -inset-2 rounded-full bg-[#30d7b0]/60 animate-ping"></div>`
+                  ? `<div class="absolute -inset-2.5 rounded-full bg-[#30d7b0]/60 animate-ping"></div>`
                   : ''
               }
               <div class="relative flex items-center justify-center h-7 min-w-7 px-1.5 rounded-full border-2 shadow-lg transition-transform duration-200 hover:scale-125 ${
                 isSelectedUni
-                  ? 'bg-[#30d7b0] border-white text-[#071b34] ring-4 ring-[#30d7b0]/40 z-50'
+                  ? 'bg-[#30d7b0] border-white text-[#071b34] ring-4 ring-[#30d7b0]/40 z-50 scale-110'
                   : isSelectedState
                   ? 'bg-[#087e6a] border-white text-white z-40'
                   : 'bg-[#071b34] border-[#30d7b0] text-white hover:bg-[#087e6a]'
@@ -226,12 +389,12 @@ export function UsaTerrainMap({ selectedState, onSelectState, onResetAll }: UsaT
 
         // Rich Popup Content
         const popupHtml = `
-          <div style="font-family: inherit; min-width: 260px; max-width: 320px; padding: 4px;">
+          <div style="font-family: inherit; min-width: 270px; max-width: 320px; padding: 4px;">
             <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
               <span style="background: #071b34; color: #30d7b0; font-size: 11px; font-weight: bold; font-family: monospace; padding: 2px 8px; border-radius: 6px;">
                 RANK #${u.rank}
               </span>
-              <span style="font-size: 11px; color: #475569; font-weight: 600;">
+              <span style="font-size: 11px; color: #475569; font-weight: 700;">
                 ${u.city}, ${u.state}
               </span>
             </div>
@@ -255,7 +418,7 @@ export function UsaTerrainMap({ selectedState, onSelectState, onResetAll }: UsaT
               </div>
               <div style="display: flex; justify-content: space-between;">
                 <span style="color: #64748b;">GRE Requirement:</span>
-                <span style="color: #0284c7; font-weight: 500;">${u.gre}</span>
+                <span style="color: #0284c7; font-weight: 600;">${u.gre}</span>
               </div>
             </div>
 
@@ -285,9 +448,9 @@ export function UsaTerrainMap({ selectedState, onSelectState, onResetAll }: UsaT
 
       // Zoom & Pan to selected state if applicable
       if (selectedState !== 'All states') {
-        const stateConfig = STATE_BOUNDS_CENTER[selectedState]
-        if (stateConfig) {
-          map.flyTo(stateConfig.center, stateConfig.zoom, { duration: 1.2 })
+        const stateCentroid = ALL_STATE_CENTROIDS_GPS[selectedState]
+        if (stateCentroid) {
+          map.flyTo([stateCentroid.lat, stateCentroid.lng], 6.5, { duration: 1.2 })
         }
       }
     })
@@ -317,7 +480,7 @@ export function UsaTerrainMap({ selectedState, onSelectState, onResetAll }: UsaT
             USA Computer Science PhD Map
           </h2>
           <p className="mt-1 text-xs sm:text-sm text-[#a5c4df] max-w-2xl">
-            Physical terrain map with all 100 leading CS PhD institutions marked with live ranking pins, projected Fall 2027 deadlines, and faculty rosters.
+            Physical terrain map with prominent state borders, state name labels, 100 ranking pins, and projected Fall 2027 deadlines.
           </p>
         </div>
 
@@ -389,23 +552,23 @@ export function UsaTerrainMap({ selectedState, onSelectState, onResetAll }: UsaT
       {/* Map + Side Inspector Split View */}
       <div className="grid lg:grid-cols-[1fr_370px] xl:grid-cols-[1fr_410px]">
         {/* Leaflet Physical Map Container */}
-        <div className="relative w-full h-[520px] lg:h-[600px] bg-[#071b34]">
+        <div className="relative w-full h-[540px] lg:h-[620px] bg-[#071b34]">
           <div ref={mapContainerRef} className="w-full h-full z-0" />
 
           {/* Map Overlay Badge */}
-          <div className="absolute top-4 left-4 z-10 rounded-xl bg-[#071b34]/90 p-2.5 text-xs backdrop-blur-md border border-white/15 shadow-xl text-white pointer-events-none">
+          <div className="absolute top-4 left-4 z-10 rounded-xl bg-[#071b34]/95 p-2.5 text-xs backdrop-blur-md border border-white/15 shadow-xl text-white pointer-events-none">
             <div className="flex items-center gap-1.5 font-bold text-[#30d7b0]">
               <MapPin size={13} />
               {selectedState !== 'All states'
                 ? `Filtered: ${STATE_NAMES[selectedState] || selectedState}`
-                : 'Showing 100 Universities'}
+                : 'Showing 100 Universities Across All States'}
             </div>
-            <p className="text-[11px] text-[#a5c4df] mt-0.5">Click any rank pin to inspect admission details</p>
+            <p className="text-[11px] text-[#a5c4df] mt-0.5">Click any state polygon or rank pin to inspect admission details</p>
           </div>
         </div>
 
         {/* Right Side Program & State Inspector */}
-        <div className="flex flex-col border-t lg:border-t-0 lg:border-l border-white/10 bg-[#081b31]/95 p-5 backdrop-blur-md h-full max-h-[600px] overflow-hidden">
+        <div className="flex flex-col border-t lg:border-t-0 lg:border-l border-white/10 bg-[#081b31]/95 p-5 backdrop-blur-md h-full max-h-[620px] overflow-hidden">
           <div className="flex items-center justify-between border-b border-white/10 pb-3">
             <div>
               <Badge className="bg-[#30d7b0] text-[#071b34] font-bold hover:bg-[#30d7b0]">
