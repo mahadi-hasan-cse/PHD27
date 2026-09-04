@@ -22,7 +22,7 @@ import { Button, buttonVariants } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { NativeSelect, NativeSelectOption } from '@/components/ui/native-select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { UsaMap } from '@/components/usa-map'
+import { UsaTerrainMap } from '@/components/usa-terrain-map'
 
 type SortKey = 'rank' | 'university' | 'deadline' | 'fee'
 const money = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 })
@@ -237,9 +237,9 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Interactive USA Map Section */}
+        {/* Interactive USA Terrain Map Section */}
         <div className="space-y-3">
-          <UsaMap
+          <UsaTerrainMap
             selectedState={state}
             onSelectState={handleStateSelect}
             onResetAll={resetAll}
